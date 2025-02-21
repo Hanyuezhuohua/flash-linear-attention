@@ -5,7 +5,34 @@ from typing import Optional
 import torch
 from einops import rearrange, repeat
 
-def naive_nsa(
+class Rotary(torch.nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
+
+def naive_nsa_pe(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -53,6 +80,9 @@ def naive_nsa(
     dtype = q.dtype
     G = q.shape[2] // k.shape[2]
     BS = block_size
+
+    rotary = Rotary(dim=q.shape[-1], base=10000)
+    cos, sin = rotary(k)
     k, v, indices = (repeat(x, 'b t h d -> b t (h g) d', g=G) for x in (k, v, indices))
     q, k, v = map(lambda x: x.float(), (q, k, v))
 
@@ -84,10 +114,12 @@ def naive_nsa(
 
             # [S*BS, HQ, -1]
             k_i, v_i = map(lambda x: x.gather(0, i_i.unsqueeze(-1).expand(*i_i.shape, x.shape[-1])), (k_b, v_b))
+
+            q_i = apply_rotary_emb(q_i.unsqueeze(0).unsqueeze(0), cos[:, k_i.shape[0]-1:k_i.shape[0], :, :], sin[:, k_i.shape[0]-1:k_i.shape[0], :, :]).squeeze(0).squeeze(0)
+            k_i = apply_rotary_emb(k_i.unsqueeze(0), cos[:, :k_i.shape[0], :, :], sin[:, :k_i.shape[0], :, :]).squeeze(0)
+
             # [S*BS, HQ]
             attn = torch.einsum('h d, n h d -> n h', q_i, k_i).softmax(0)
-            # [S*BS, HQ]
-            attn = torch.einsum('h d, n h d -> n h', q_i, k_i).masked_fill(i_i > i_q, float('-inf')).softmax(0)
             if not varlen:
                 o[i, i_q] = torch.einsum('n h, n h v -> h v', attn, v_i)
             else:
