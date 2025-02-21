@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 from typing import Optional
 
 import torch
 from einops import rearrange, repeat
+
 
 def naive_nsa(
     q: torch.Tensor,
@@ -68,7 +70,7 @@ def naive_nsa(
             q_b, k_b, v_b, i_b = q[i], k[i], v[i], indices[i]
         else:
             T = cu_seqlens[i+1] - cu_seqlens[i]
-            q_b, k_b, v_b, i_b = map(lambda x: x[cu_seqlens[i]:cu_seqlens[i+1]], (q, k, v, indices))
+            q_b, k_b, v_b, i_b = map(lambda x: x[0][cu_seqlens[i]:cu_seqlens[i+1]], (q, k, v, indices))
 
         i_b = i_b.unsqueeze(-1) * BS + i_b.new_tensor(range(BS))
         # [T, S*BS, HQ]
@@ -78,20 +80,14 @@ def naive_nsa(
             q_i = q_b[i_q] * scale
             # [S*BS, HQ]
             i_i = i_b[i_q]
-
-            valid_mask = i_i <= i_q
-            i_i = i_i[valid_mask].reshape(-1, q_i.shape[0])
-
             # [S*BS, HQ, -1]
-            k_i, v_i = map(lambda x: x.gather(0, i_i.unsqueeze(-1).expand(*i_i.shape, x.shape[-1])), (k_b, v_b))
-            # [S*BS, HQ]
-            attn = torch.einsum('h d, n h d -> n h', q_i, k_i).softmax(0)
+            k_i, v_i = map(lambda x: x.gather(0, i_i.clamp(0, T-1).unsqueeze(-1).expand(*i_i.shape, x.shape[-1])), (k_b, v_b))
             # [S*BS, HQ]
             attn = torch.einsum('h d, n h d -> n h', q_i, k_i).masked_fill(i_i > i_q, float('-inf')).softmax(0)
             if not varlen:
                 o[i, i_q] = torch.einsum('n h, n h v -> h v', attn, v_i)
             else:
-                o[cu_seqlens[i]+i_q] = torch.einsum('n h, n h v -> h v', attn, v_i)
+                o[0][cu_seqlens[i]+i_q] = torch.einsum('n h, n h v -> h v', attn, v_i)
 
     if head_first:
         o = rearrange(o, 'b t h d -> b h t d')

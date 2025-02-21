@@ -6,10 +6,13 @@ import triton
 
 from fla.utils import tensor_cache
 
+@tensor_cache
+def prepare_lens(offsets: torch.LongTensor) -> torch.LongTensor:
+    return offsets[1:] - offsets[:-1]
 
 @tensor_cache
-def prepare_sequence_indices(offsets: torch.LongTensor) -> torch.LongTensor:
-    indices = torch.cat([torch.arange(n) for n in (offsets[1:] - offsets[:-1]).tolist()])
+def prepare_token_indices(offsets: torch.LongTensor) -> torch.LongTensor:
+    indices = torch.cat([torch.arange(n) for n in (prepare_lens(offsets)).tolist()])
     indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(offsets)
     return indices
 
